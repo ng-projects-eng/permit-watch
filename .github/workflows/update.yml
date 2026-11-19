@@ -1,0 +1,53 @@
+name: update
+
+on:
+  schedule:
+    - cron: "17 4 * * *"   # every day ~05:17 Geneva winter time
+  workflow_dispatch:
+    inputs:
+      notify:
+        description: "Send the push notification now"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: update
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Download permit data
+        run: python fetch.py
+
+      - name: Save data for the map
+        run: |
+          git config user.name "permit-watch"
+          git config user.email "permit-watch@users.noreply.github.com"
+          git add docs/data
+          git diff --cached --quiet || git commit -m "Update permit data"
+          git push
+
+      - name: Weekly push (Mondays, or when run by hand)
+        env:
+          HOME_LAT: ${{ secrets.HOME_LAT }}
+          HOME_LON: ${{ secrets.HOME_LON }}
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          MAP_URL: ${{ vars.MAP_URL }}
+          RADIUS_M: "500"
+        run: |
+          if [ "$(TZ=Europe/Zurich date +%u)" = "1" ] || [ "${{ inputs.notify }}" = "true" ]; then
+            python notify.py
+          else
+            echo "Not Monday: no push today."
+          fi
