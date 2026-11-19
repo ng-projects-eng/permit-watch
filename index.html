@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>Autorisations de construire – rive gauche est</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
+<style>
+  :root { --red:#c0392b; --amber:#d68910; --grey:#8a8f93; --ink:#1f2328; --muted:#5f6b76; --line:#d9dde1; }
+  * { box-sizing: border-box; }
+  html, body { margin:0; height:100%; font-family: -apple-system, system-ui, "Segoe UI", Roboto, sans-serif; color:var(--ink); }
+  #map { position:absolute; inset:0; }
+  .panel { position:absolute; z-index:1000; top:10px; left:10px; right:10px; max-width:430px;
+           background:#fff; border:1px solid var(--line); border-radius:12px; padding:10px; }
+  .row { display:flex; gap:6px; align-items:center; flex-wrap:wrap; }
+  .row + .row { margin-top:8px; }
+  input[type=search] { flex:1; min-width:0; font-size:16px; padding:8px 10px; border:1px solid var(--line); border-radius:8px; }
+  button, select { font-size:14px; padding:7px 10px; border:1px solid var(--line); border-radius:8px; background:#fff; color:var(--ink); }
+  .chip { display:inline-flex; align-items:center; gap:6px; cursor:pointer; user-select:none; }
+  .chip[aria-pressed=false] { opacity:.45; }
+  .dot { width:11px; height:11px; border-radius:50%; display:inline-block; }
+  .info { font-size:13px; color:var(--muted); }
+  #results { list-style:none; margin:6px 0 0; padding:0; border:1px solid var(--line); border-radius:8px; display:none; }
+  #results li { padding:8px 10px; font-size:14px; cursor:pointer; border-top:1px solid var(--line); }
+  #results li:first-child { border-top:0; }
+  .pop h3 { margin:0 0 4px; font-size:15px; }
+  .pop .meta { color:var(--muted); font-size:12px; margin-bottom:6px; }
+  .pop p { margin:0 0 6px; font-size:13px; line-height:1.4; }
+  .badge { display:inline-block; font-size:11px; padding:1px 6px; border-radius:6px; background:#111; color:#fff; margin-left:4px; }
+  #toggle { display:none; }
+  @media (max-width: 520px) { .panel.collapsed .hideable { display:none; } #toggle { display:inline-block; } }
+</style>
+</head>
+<body>
+<div id="map"></div>
+<div class="panel" id="panel">
+  <div class="row">
+    <input id="q" type="search" placeholder="Adresse (ex. une maison à visiter)" autocomplete="off">
+    <button id="locate" title="Ma position">◎</button>
+    <button id="toggle" aria-label="Afficher ou masquer les filtres">☰</button>
+  </div>
+  <ul id="results"></ul>
+  <div class="row hideable">
+    <span class="chip" data-cat="major" aria-pressed="true" role="button"><span class="dot" style="background:var(--red)"></span>Importants <span id="n-major"></span></span>
+    <span class="chip" data-cat="future" aria-pressed="true" role="button"><span class="dot" style="background:var(--amber)"></span>Projets futurs <span id="n-future"></span></span>
+    <span class="chip" data-cat="minor" aria-pressed="false" role="button"><span class="dot" style="background:var(--grey)"></span>Mineurs <span id="n-minor"></span></span>
+  </div>
+  <div class="row hideable">
+    <select id="period">
+      <option value="3">3 derniers mois</option>
+      <option value="6">6 derniers mois</option>
+      <option value="12" selected>12 derniers mois</option>
+      <option value="24">24 derniers mois</option>
+    </select>
+    <select id="radius">
+      <option value="300">Rayon 300 m</option>
+      <option value="500" selected>Rayon 500 m</option>
+      <option value="1000">Rayon 1 km</option>
+    </select>
+  </div>
+  <div class="row info" id="info">Chargement…</div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<script>
+const COLORS = { major: "#c0392b", future: "#d68910", minor: "#8a8f93" };
+const SIZES = { major: 8, future: 7, minor: 5 };
+const NEW_DAYS = 7;
+const state = { cats: { major: true, future: true, minor: false }, months: 12, radius: 500, centre: null, features: [] };
+
+const map = L.map("map", { preferCanvas: true, zoomControl: false }).setView([46.245, 6.205], 13);
+L.control.zoom({ position: "bottomright" }).addTo(map);
+const swissAttr = '&copy; <a href="https://www.swisstopo.admin.ch">swisstopo</a> · Données: <a href="https://sitg.ge.ch">SITG</a>';
+const plan = L.tileLayer("https://wmts.geo.admin.ch/1.0.0/ch.swisstopo.pixelkarte-grau/default/current/3857/{z}/{x}/{y}.jpeg",
+  { maxNativeZoom: 18, maxZoom: 19, attribution: swissAttr }).addTo(map);
+const photo = L.tileLayer("https://wmts.geo.admin.ch/1.0.0/ch.swisstopo.swissimage/default/current/3857/{z}/{x}/{y}.jpeg",
+  { maxNativeZoom: 19, maxZoom: 20, attribution: swissAttr });
+L.control.layers({ "Plan": plan, "Photo aérienne": photo }, null, { position: "bottomleft" }).addTo(map);
+
+const pins = L.layerGroup().addTo(map);
+let circle = null, centreMark = null;
+
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[c]));
+const fmt = iso => iso ? iso.split("-").reverse().join(".") : "–";
+const isoDaysAgo = n => new Date(Date.now() - n * 864e5).toISOString().slice(0, 10);
+
+function dist(a, b) {
+  const R = 6371000, r = Math.PI / 180;
+  const dLat = (b[0] - a[0]) * r, dLon = (b[1] - a[1]) * r;
+  const h = Math.sin(dLat / 2) ** 2 + Math.cos(a[0] * r) * Math.cos(b[0] * r) * Math.sin(dLon / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(h));
+}
+
+function popup(p, latlng) {
+  const isNew = (p.filed || "") >= isoDaysAgo(NEW_DAYS);
+  const d = state.centre ? Math.round(dist(state.centre, [latlng.lat, latlng.lng]) / 10) * 10 : null;
+  return `<div class="pop">
+    <h3>${esc(p.typeLabel)} (${esc(p.type)})${isNew ? '<span class="badge">nouveau</span>' : ""}</h3>
+    <div class="meta">${esc(p.name)}${p.status ? " · " + esc(p.status) : ""}${d !== null ? " · " + d + " m" : ""}</div>
+    <p>${esc(p.description) || "<i>Pas de description</i>"}</p>
+    <div class="meta">Déposé le ${fmt(p.filed)} · mis à jour le ${fmt(p.updated)}</div>
+    ${p.link ? `<a href="${esc(p.link)}" target="_blank" rel="noopener">Voir le dossier officiel</a>` : ""}
+  </div>`;
+}
+
+function render() {
+  pins.clearLayers();
+  const since = isoDaysAgo(state.months * 30.4);
+  const recent = isoDaysAgo(NEW_DAYS);
+  const counts = { major: 0, future: 0, minor: 0 };
+  let near = 0, nearMajor = 0;
+  const order = { minor: 0, future: 1, major: 2 };
+  const shown = state.features
+    .filter(f => ((f.properties.filed || "") >= since) || ((f.properties.updated || "") >= since))
+    .sort((a, b) => order[a.properties.category] - order[b.properties.category]);
+  for (const f of shown) {
+    const p = f.properties, cat = p.category in COLORS ? p.category : "minor";
+    counts[cat]++;
+    if (!state.cats[cat]) continue;
+    const [lon, lat] = f.geometry.coordinates;
+    if (state.centre && dist(state.centre, [lat, lon]) <= state.radius) { near++; if (cat !== "minor") nearMajor++; }
+    const isNew = (p.filed || "") >= recent;
+    L.circleMarker([lat, lon], {
+      radius: SIZES[cat] + (isNew ? 2 : 0), color: isNew ? "#111" : "#fff", weight: isNew ? 3 : 1.5,
+      fillColor: COLORS[cat], fillOpacity: 0.9
+    }).bindPopup(l => popup(p, l.getLatLng()), { maxWidth: 300 }).addTo(pins);
+  }
+  for (const c of Object.keys(counts)) document.getElementById("n-" + c).textContent = `(${counts[c]})`;
+  const info = document.getElementById("info");
+  const parts = [];
+  if (state.centre) parts.push(`${near} dossier(s) affiché(s) dans ${state.radius} m, dont ${nearMajor} importants/futurs.`);
+  else parts.push("Cherchez une adresse pour tracer le rayon.");
+  if (state.meta) parts.push(`Données du ${fmt(state.meta.updated.slice(0, 10))}.`);
+  info.textContent = parts.join(" ");
+}
+
+function setCentre(lat, lon, fly = true) {
+  state.centre = [lat, lon];
+  if (circle) map.removeLayer(circle);
+  if (centreMark) map.removeLayer(centreMark);
+  circle = L.circle([lat, lon], { radius: state.radius, color: "#1f6feb", weight: 2, dashArray: "6 6", fill: false, interactive: false }).addTo(map);
+  centreMark = L.circleMarker([lat, lon], { radius: 5, color: "#1f6feb", fillColor: "#1f6feb", fillOpacity: 1, interactive: false }).addTo(map);
+  const h = `#${lat.toFixed(5)},${lon.toFixed(5)}`;
+  if (location.hash !== h) history.replaceState(null, "", h);
+  if (fly) map.fitBounds(circle.getBounds(), { padding: [20, 20] });
+  render();
+}
+
+function readHash() {
+  const m = location.hash.slice(1).split(",").map(Number);
+  if (m.length >= 2 && m.every(Number.isFinite) && Math.abs(m[0]) <= 90 && Math.abs(m[1]) <= 180) setCentre(m[0], m[1]);
+}
+
+document.querySelectorAll(".chip").forEach(el => el.addEventListener("click", () => {
+  const c = el.dataset.cat; state.cats[c] = !state.cats[c];
+  el.setAttribute("aria-pressed", String(state.cats[c])); render();
+}));
+document.getElementById("period").addEventListener("change", e => { state.months = +e.target.value; render(); });
+document.getElementById("radius").addEventListener("change", e => {
+  state.radius = +e.target.value;
+  if (state.centre) setCentre(state.centre[0], state.centre[1]); else render();
+});
+document.getElementById("toggle").addEventListener("click", () => document.getElementById("panel").classList.toggle("collapsed"));
+document.getElementById("locate").addEventListener("click", () => {
+  if (!navigator.geolocation) return;
+  navigator.geolocation.getCurrentPosition(pos => setCentre(pos.coords.latitude, pos.coords.longitude),
+    () => { document.getElementById("info").textContent = "Position indisponible."; });
+});
+
+const q = document.getElementById("q"), results = document.getElementById("results");
+let searchTimer = null;
+q.addEventListener("input", () => {
+  clearTimeout(searchTimer);
+  const text = q.value.trim();
+  if (text.length < 3) { results.style.display = "none"; return; }
+  searchTimer = setTimeout(async () => {
+    try {
+      const url = "https://api3.geo.admin.ch/rest/services/api/SearchServer?type=locations&sr=4326&limit=6&origins=address,parcel&searchText="
+        + encodeURIComponent(text);
+      const data = await (await fetch(url)).json();
+      results.innerHTML = "";
+      for (const r of data.results || []) {
+        const li = document.createElement("li");
+        li.textContent = (r.attrs.label || "").replace(/<[^>]+>/g, "");
+        li.addEventListener("click", () => {
+          results.style.display = "none"; q.value = li.textContent;
+          setCentre(r.attrs.lat, r.attrs.lon);
+        });
+        results.appendChild(li);
+      }
+      results.style.display = results.children.length ? "block" : "none";
+    } catch { results.style.display = "none"; }
+  }, 300);
+});
+
+Promise.all([
+  fetch("data/permits.geojson", { cache: "no-cache" }).then(r => r.json()),
+  fetch("data/meta.json", { cache: "no-cache" }).then(r => r.json()).catch(() => null)
+]).then(([geo, meta]) => {
+  state.features = geo.features || []; state.meta = meta;
+  render(); readHash();
+}).catch(() => { document.getElementById("info").textContent = "Données introuvables (premier lancement pas encore fait ?)."; });
+window.addEventListener("hashchange", readHash);
+</script>
+</body>
+</html>
